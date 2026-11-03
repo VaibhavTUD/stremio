@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.vaibhavtud.stremiotv.resign</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/USERNAME/stremio-tv-signer/resign-and-install.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>STREMIOTV_DEVICE</key><string>APPLE-TV-IDENTIFIER</string>
+    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>/Users/USERNAME/Library/Logs/stremiotv-resign.log</string>
+  <key>StandardErrorPath</key><string>/Users/USERNAME/Library/Logs/stremiotv-resign.log</string>
+</dict>
+</plist>
