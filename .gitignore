@@ -67,7 +67,8 @@ app/Config/ExternalSync.xcconfig
 *.log
 
 # agent / editor config
-.claude/
+.claude/*
+!.claude/settings.json
 CLAUDE.md
 app/Resources/fonts/
 graphify-out/
