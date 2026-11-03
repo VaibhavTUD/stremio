@@ -1,0 +1,183 @@
+name: Mirror tvOS IPA
+
+# Publishes the official VortX tvOS IPA (Full build, not Lite) as a release of THIS fork, with our
+# own bundle identifier, for atvloadly to install and re-sign on the Apple TV.
+#
+# Why a mirror and not a source build: the VortX engine lives in a private repository
+# (VortXTV/vortx-core) that release-tvos.yml fetches with ENGINE_REPO_TOKEN. Without that token a
+# build from this fork can only link the CI stub engine, which does not work at runtime.
+#
+# Releases are tagged "tv-<upstream tag>" (this fork already carries every upstream v* tag) and
+# always carry the same asset names, so the newest one is always at
+#   https://github.com/<owner>/<repo>/releases/latest/download/StremioTV.ipa
+#
+# Triggers:
+#   schedule           daily; mirrors the newest upstream release if we do not have it yet
+#   push tag tv-v*     mirrors that upstream tag (git tag tv-v0.5.5 && git push origin tv-v0.5.5)
+#   workflow_dispatch  mirrors a chosen upstream tag, or the newest when left blank
+#
+# Repository variable MIRROR_PRERELEASES=true also mirrors upstream betas (default: stable only).
+# Releases created here use GITHUB_TOKEN, so they do not trigger release-tvos.yml or this workflow.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  push:
+    tags: ["tv-v*"]
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream VortX release tag to mirror (e.g. v0.5.5). Blank mirrors the newest."
+        required: false
+        default: ""
+      force:
+        description: "Replace the assets if our release for this tag already exists."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-tvos-ipa
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: VortXTV/VortX
+  BUNDLE_ID: com.vaibhavtud.stremiotv # never change: a stable ID keeps login and data across re-signs
+  TAG_PREFIX: tv-
+  ASSET_NAME: StremioTV.ipa
+
+jobs:
+  mirror:
+    if: github.repository != 'VortXTV/VortX'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Pick the upstream release
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          FORCE: ${{ inputs.force }}
+          INCLUDE_PRERELEASES: ${{ vars.MIRROR_PRERELEASES }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            want="${GITHUB_REF_NAME#"$TAG_PREFIX"}"
+          else
+            want="${INPUT_TAG:-}"
+          fi
+          pre=false; [ "${INCLUDE_PRERELEASES:-}" = true ] && pre=true
+
+          # Full tvOS IPA only, e.g. VortX-tvOS-v0.5.5-ci.ipa (never the Lite build).
+          assets='[.assets[] | select(.name | test("^VortX-tvOS-.*\\.ipa$")) | select(.name | test("lite"; "i") | not)]'
+          if [ -n "$want" ]; then
+            [[ "$want" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid upstream tag: $want"; exit 1; }
+            release=$(gh api "repos/$UPSTREAM_REPO/releases/tags/$want")
+          else
+            release=$(gh api "repos/$UPSTREAM_REPO/releases?per_page=100" | jq -c --argjson pre "$pre" \
+              "[.[] | select(.draft | not) | select(\$pre or (.prerelease | not)) | select(($assets) | length > 0)] | first // empty")
+            [ -n "$release" ] || { echo "::error::no upstream release with a tvOS IPA found"; exit 1; }
+          fi
+
+          tag=$(jq -r '.tag_name' <<<"$release")
+          [[ "$tag" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::unexpected upstream tag: $tag"; exit 1; }
+          asset=$(jq -c "$assets | first // empty" <<<"$release")
+          [ -n "$asset" ] || { echo "::error::upstream $tag has no Full tvOS IPA"; exit 1; }
+
+          ours="$TAG_PREFIX$tag"
+          exists=false
+          gh release view "$ours" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && exists=true
+          skip=false
+          if [ "$exists" = true ] && [ "${FORCE:-false}" != true ]; then
+            echo "::notice::$ours is already mirrored; nothing to do"
+            skip=true
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "ours=$ours"
+            echo "exists=$exists"
+            echo "skip=$skip"
+            echo "url=$(jq -r '.browser_download_url' <<<"$asset")"
+            echo "name=$(jq -r '.name' <<<"$asset")"
+            echo "digest=$(jq -r '.digest // ""' <<<"$asset")"
+            echo "html=$(jq -r '.html_url' <<<"$release")"
+          } >>"$GITHUB_OUTPUT"
+          echo "upstream $tag -> $ours (exists=$exists, skip=$skip)"
+
+      - name: Download and verify the upstream IPA
+        if: steps.pick.outputs.skip != 'true'
+        env:
+          URL: ${{ steps.pick.outputs.url }}
+          DIGEST: ${{ steps.pick.outputs.digest }}
+        run: |
+          set -euo pipefail
+          case "$URL" in "https://github.com/$UPSTREAM_REPO/releases/download/"*) ;; *) echo "::error::unexpected asset URL: $URL"; exit 1 ;; esac
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/upstream.ipa" "$URL"
+          if [ -n "$DIGEST" ]; then
+            echo "${DIGEST#sha256:}  $RUNNER_TEMP/upstream.ipa" | sha256sum --check --strict
+          else
+            echo "::warning::upstream asset has no published digest; skipping checksum check"
+          fi
+          unzip -tqq "$RUNNER_TEMP/upstream.ipa"
+
+      - name: Set our bundle identifier
+        if: steps.pick.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python3 -I scripts/rebundle-tvos-ipa.py "$RUNNER_TEMP/upstream.ipa" "out/$ASSET_NAME" --bundle-id "$BUNDLE_ID" | tee "$RUNNER_TEMP/rebundle.json"
+          unzip -tqq "out/$ASSET_NAME"
+          (cd out && sha256sum "$ASSET_NAME" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+      - name: Publish our release
+        if: steps.pick.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          OURS: ${{ steps.pick.outputs.ours }}
+          EXISTS: ${{ steps.pick.outputs.exists }}
+          UPSTREAM_NAME: ${{ steps.pick.outputs.name }}
+          UPSTREAM_HTML: ${{ steps.pick.outputs.html }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          version=$(jq -r '.version' "$RUNNER_TEMP/rebundle.json")
+          build=$(jq -r '.build' "$RUNNER_TEMP/rebundle.json")
+          sha=$(cut -d' ' -f1 out/SHA256SUMS.txt)
+          {
+            echo "Unsigned tvOS IPA mirrored from [$UPSTREAM_REPO $TAG]($UPSTREAM_HTML) (\`$UPSTREAM_NAME\`)."
+            echo
+            echo "- Bundle ID: \`$BUNDLE_ID\`"
+            echo "- Version: $version ($build)"
+            echo "- SHA-256: \`$sha\`"
+            echo
+            echo "Install and re-sign with atvloadly."
+          } > "$RUNNER_TEMP/notes.md"
+
+          if [ "$EXISTS" = true ]; then
+            gh release upload "$OURS" "out/$ASSET_NAME" out/SHA256SUMS.txt --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "$OURS" --notes-file "$RUNNER_TEMP/notes.md" -R "$GITHUB_REPOSITORY"
+            exit 0
+          fi
+
+          # A hand-picked older tag must not become "latest" and pull the TV back to an old build.
+          latest=true
+          [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ -n "${INPUT_TAG:-}" ] && latest=false
+          args=("$OURS" "out/$ASSET_NAME" out/SHA256SUMS.txt -R "$GITHUB_REPOSITORY"
+                --title "Stremio TV $TAG" --notes-file "$RUNNER_TEMP/notes.md" "--latest=$latest")
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            args+=(--verify-tag)
+          else
+            args+=(--target "$GITHUB_SHA")
+          fi
+          gh release create "${args[@]}"
